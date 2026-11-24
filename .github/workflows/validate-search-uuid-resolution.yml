@@ -1,0 +1,67 @@
+name: Verify Search UUID resolution regression (194159)
+on:
+  push:
+    branches:
+      - verify/194159-uuid-red-green
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  red-green:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    env:
+      UV_CACHE_DIR: /tmp/uv-cache
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout validation branch
+        uses: actions/checkout@v4
+      - name: Setup Home Assistant test dependencies
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14.10"
+          uv-version: "0.13.8"
+          python-cache-key: "search-issue-194159"
+          uv-cache-dir: /tmp/uv-cache
+          apt-cache-version: "2"
+      - name: Generate development translations
+        run: |
+          . venv/bin/activate
+          python -m script.translations develop --all
+      - name: GREEN - Search integration tests on fixed implementation
+        run: |
+          . venv/bin/activate
+          python -m pytest -q tests/components/search/test_init.py --no-cov -o addopts=""
+      - name: Mutate resolver to silently skip registry UUIDs
+        run: |
+          . venv/bin/activate
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("homeassistant/components/search/__init__.py")
+          content = path.read_text()
+          original = """            resolved_entity_id = er.async_resolve_entity_id(
+                          self._entity_registry, entity_id
+                      )"""
+          broken = """            resolved_entity_id = entity_id if "." in entity_id else None"""
+          assert content.count(original) == 2, "Unexpected production code shape"
+          path.write_text(content.replace(original, broken))
+          print("Intentional mutation applied in both automation and script search")
+          PY
+      - name: RED - New regression tests must fail with broken implementation
+        shell: bash
+        run: |
+          . venv/bin/activate
+          set +e
+          python -m pytest -q tests/components/search/test_init.py -k test_search_related_resolves_entity_registry_ids --no-cov -o addopts="" > /tmp/red-result.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/red-result.txt
+          if [ "$code" -eq 0 ]; then
+            echo "::error::Regression tests did not catch intentionally broken UUID resolution"
+            exit 1
+          fi
+          if ! grep -Eq "2 failed" /tmp/red-result.txt; then
+            echo "::error::Expected BOTH automation and script regression tests to fail"
+            exit 1
+          fi
+          echo "PASS: Both regression tests detect the broken implementation"
